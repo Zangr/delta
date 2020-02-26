@@ -27,6 +27,7 @@ import org.apache.spark.sql.delta.util.{AnalysisHelper, SetAccumulator}
 import org.apache.spark.SparkContext
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.encoders.{ExpressionEncoder, RowEncoder}
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Expression, Literal, PredicateHelper, UnsafeProjection}
 import org.apache.spark.sql.catalyst.expressions.codegen._
@@ -101,13 +102,40 @@ case class MergeIntoCommand(
   @transient private lazy val sc: SparkContext = SparkContext.getOrCreate()
   @transient private lazy val targetDeltaLog: DeltaLog = targetFileIndex.deltaLog
 
-  /** Whether this merge statement only inserts new data. */
-  private def isInsertOnly: Boolean = matchedClauses.isEmpty && notMatchedClause.isDefined
+  lazy val insertClause: Option[DeltaMergeIntoInsertClause] = notMatchedClause.map {
+    case i: DeltaMergeIntoInsertClause if i.resolvedActions == Seq(DeltaMergeStarAction) =>
+      // INSERT * - expand into column names.
+      val expanded = target.output.map { targetCol =>
+        val colName = targetCol.name
+        val sourceCol = source.resolve(Seq(colName), conf.resolver).getOrElse {
+          throw DeltaErrors.mergeInsertResolutionException(colName)
+        }
+        DeltaMergeAction(Seq(colName), sourceCol)
+      }
+      i.copy(actions = expanded)
+    case i: DeltaMergeIntoInsertClause => i
+  }
 
-  lazy val updateClause: Option[DeltaMergeIntoUpdateClause] =
-    matchedClauses.collectFirst { case u: DeltaMergeIntoUpdateClause => u }
+  lazy val updateClause: Option[DeltaMergeIntoUpdateClause] = matchedClauses.collectFirst {
+    case u: DeltaMergeIntoUpdateClause if u.resolvedActions == Seq(DeltaMergeStarAction) =>
+      // UPDATE * - expand into column names.
+      val expanded = target.output.map { targetCol =>
+        val colName = targetCol.name
+        val sourceCol = source.resolve(Seq(colName), conf.resolver).getOrElse {
+          throw DeltaErrors.mergeUpdateResolutionException(colName)
+        }
+        DeltaMergeAction(Seq(colName), sourceCol)
+      }
+      u.copy(actions = expanded)
+    case u: DeltaMergeIntoUpdateClause => u
+  }
+
   lazy val deleteClause: Option[DeltaMergeIntoDeleteClause] =
     matchedClauses.collectFirst { case d: DeltaMergeIntoDeleteClause => d }
+
+  /** Whether this merge statement only inserts new data. */
+  private def isInsertOnly: Boolean =
+    updateClause.isEmpty && deleteClause.isEmpty && insertClause.isDefined
 
   override lazy val metrics = Map[String, SQLMetric](
     "numSourceRows" -> createMetric(sc, "number of source rows"),
@@ -142,7 +170,7 @@ case class MergeIntoCommand(
           Option(condition.sql),
           updateClause.flatMap(_.condition).map(_.sql),
           deleteClause.flatMap(_.condition).map(_.sql),
-          notMatchedClause.flatMap(_.condition).map(_.sql)))
+          insertClause.flatMap(_.condition).map(_.sql)))
 
       // Record metrics
       val stats = MergeStats(
@@ -150,8 +178,8 @@ case class MergeIntoCommand(
         conditionExpr = condition.sql,
         updateConditionExpr = updateClause.flatMap(_.condition).map(_.sql).orNull,
         updateExprs = updateClause.map(_.actions.map(_.sql).toArray).orNull,
-        insertConditionExpr = notMatchedClause.flatMap(_.condition).map(_.sql).orNull,
-        insertExprs = notMatchedClause.map(_.actions.map(_.sql).toArray).orNull,
+        insertConditionExpr = insertClause.flatMap(_.condition).map(_.sql).orNull,
+        insertExprs = insertClause.map(_.actions.map(_.sql).toArray).orNull,
         deleteConditionExpr = deleteClause.flatMap(_.condition).map(_.sql).orNull,
 
         // Data sizes of source and target at different stages of processing
@@ -255,7 +283,7 @@ case class MergeIntoCommand(
     val incrInsertedCountExpr = makeMetricUpdateUDF("numTargetRowsInserted")
 
     val outputColNames = target.output.map(_.name)
-    val outputExprs = notMatchedClause.get.resolvedActions.map(_.expr) :+ incrInsertedCountExpr
+    val outputExprs = insertClause.get.resolvedActions.map(_.expr) :+ incrInsertedCountExpr
     val outputCols = outputExprs.zip(outputColNames).map { case (expr, name) =>
       new Column(Alias(expr, name)())
     }
@@ -263,7 +291,7 @@ case class MergeIntoCommand(
     // source DataFrame
     val sourceDF = Dataset.ofRows(spark, source)
       .filter(new Column(incrSourceRowCountExpr))
-      .filter(new Column(notMatchedClause.get.condition.getOrElse(Literal(true))))
+      .filter(new Column(insertClause.get.condition.getOrElse(Literal(true))))
 
     // Skip data based on the merge condition
     val conjunctivePredicates = splitConjunctivePredicates(condition)
@@ -344,7 +372,7 @@ case class MergeIntoCommand(
       resolveOnJoinedPlan(exprs)
     }
 
-    def notMatchedClauseOutput(clause: DeltaMergeIntoInsertClause): Seq[Expression] = {
+    def insertClauseOutput(clause: DeltaMergeIntoInsertClause): Seq[Expression] = {
       val exprs = clause.resolvedActions.map(_.expr) :+ Literal(false) :+ incrInsertedCountExpr
       resolveOnJoinedPlan(exprs)
     }
@@ -354,8 +382,18 @@ case class MergeIntoCommand(
       resolveOnJoinedPlan(condExprOption.toSeq).headOption
     }
 
-    val matchedClause1 = matchedClauses.headOption
-    val matchedClause2 = matchedClauses.drop(1).headOption
+    // We have to pull these clauses from the originally specified matched clause sequence, since
+    // ordering matters - delete after update and update after delete can do different things.
+    // The fully resolved version is swapped in after the fact.
+    val matchedClause1 = matchedClauses.headOption.map {
+      case _: DeltaMergeIntoUpdateClause => updateClause.get
+      case _: DeltaMergeIntoDeleteClause => deleteClause.get
+    }
+    val matchedClause2 = matchedClauses.drop(1).headOption.map {
+      case _: DeltaMergeIntoUpdateClause => updateClause.get
+      case _: DeltaMergeIntoDeleteClause => deleteClause.get
+    }
+
     val joinedRowEncoder = RowEncoder(joinedPlan.schema)
     val outputRowEncoder = RowEncoder(target.schema).resolveAndBind()
 
@@ -366,8 +404,8 @@ case class MergeIntoCommand(
       matchedOutput1 = matchedClause1.map(matchedClauseOutput),
       matchedCondition2 = clauseCondition(matchedClause2),
       matchedOutput2 = matchedClause2.map(matchedClauseOutput),
-      notMatchedCondition = clauseCondition(notMatchedClause),
-      notMatchedOutput = notMatchedClause.map(notMatchedClauseOutput),
+      notMatchedCondition = clauseCondition(insertClause),
+      notMatchedOutput = insertClause.map(insertClauseOutput),
       noopCopyOutput = resolveOnJoinedPlan(target.output :+ Literal(false) :+ incrNoopCountExpr),
       deleteRowOutput = resolveOnJoinedPlan(target.output :+ Literal(true) :+ Literal(true)),
       joinedAttributes = joinedPlan.output,

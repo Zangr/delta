@@ -747,6 +747,14 @@ object DeltaErrors
     throw new AnalysisException(
       s"Couldn't find column $column in:\n${schema.treeString}")
   }
+
+  def mergeInsertResolutionException(columnName: String): Throwable = {
+    new AnalysisException(s"Column `$columnName` could not be resolved in insert clause")
+  }
+
+  def mergeUpdateResolutionException(columnName: String): Throwable = {
+    new AnalysisException(s"Column `$columnName` could not be resolved in update clause")
+  }
 }
 
 /** The basic class for all Tahoe commit conflict exceptions. */

@@ -54,15 +54,16 @@ case class PreprocessTableMerge(conf: SQLConf) extends UpdateExpressionsSupport 
 
     val processedMatched = matched.map {
       case m: DeltaMergeIntoUpdateClause =>
-        val alignedUpdateExprs = {
-          // Use the helper methods for in UpdateExpressionsSupport to generate expressions such
-          // that nested fields can be updated.
-          val updateOps =
-            m.resolvedActions.map { a => UpdateOperation(a.targetColNameParts, a.expr) }
-          generateUpdateExpressions(target.output, updateOps, conf.resolver)
-        }
-        val alignedActions: Seq[DeltaMergeAction] = alignedUpdateExprs.zip(target.output).map {
-          case (expr, attrib) => DeltaMergeAction(Seq(attrib.name), expr)
+        val alignedActions: Seq[DeltaMergeAction] = m.resolvedActions match {
+          // Star will be aligned when expanded - at this point it's unexpanded so nothing to do.
+          case Seq(DeltaMergeStarAction) => Seq(DeltaMergeStarAction)
+          case actions =>
+            val updateOps = actions.map { a => UpdateOperation(a.targetColNameParts, a.expr) }
+            val alignedUpdateExprs =
+              generateUpdateExpressions(target.output, updateOps, conf.resolver)
+            alignedUpdateExprs.zip(target.output).map {
+              case (expr, attrib) => DeltaMergeAction(Seq(attrib.name), expr)
+            }
         }
         m.copy(m.condition, alignedActions)
 
@@ -86,19 +87,24 @@ case class PreprocessTableMerge(conf: SQLConf) extends UpdateExpressionsSupport 
       }
 
       // Reorder actions by the target column order.
-      val alignedActions: Seq[DeltaMergeAction] = target.output.map { targetAttrib =>
-        m.resolvedActions.find { a =>
-          conf.resolver(targetAttrib.name, a.targetColNameParts.head)
-        }.map { a =>
-          DeltaMergeAction(Seq(targetAttrib.name), castIfNeeded(a.expr, targetAttrib.dataType))
-        }.getOrElse {
-          // If a target table column was not found in the INSERT columns and expressions,
-          // then throw exception as there must be an expression to set every target column.
-          throw new AnalysisException(
-            s"Unable to find the column '${targetAttrib.name}' of the target table from " +
-              s"the INSERT columns: ${targetColNames.mkString(", ")}. " +
-              s"INSERT clause must specify value for all the columns of the target table.")
-        }
+      val alignedActions: Seq[DeltaMergeAction] = m.resolvedActions match {
+        // Star will be aligned when expanded - at this point it's unexpanded so nothing to do.
+        case Seq(DeltaMergeStarAction) => Seq(DeltaMergeStarAction)
+        case _ =>
+          target.output.map { targetAttrib =>
+            m.resolvedActions.find { a =>
+              conf.resolver(targetAttrib.name, a.targetColNameParts.head)
+            }.map { a =>
+              DeltaMergeAction(Seq(targetAttrib.name), castIfNeeded(a.expr, targetAttrib.dataType))
+            }.getOrElse {
+              // If a target table column was not found in the INSERT columns and expressions,
+              // then throw exception as there must be an expression to set every target column.
+              throw new AnalysisException(
+                s"Unable to find the column '${targetAttrib.name}' of the target table from " +
+                  s"the INSERT columns: ${targetColNames.mkString(", ")}. " +
+                  s"INSERT clause must specify value for all the columns of the target table.")
+            }
+          }
       }
       m.copy(m.condition, alignedActions)
     }
