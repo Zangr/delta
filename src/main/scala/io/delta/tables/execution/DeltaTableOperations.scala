@@ -31,6 +31,7 @@ import org.apache.spark.sql.catalyst.plans.logical._
 
 /**
  * Interface to provide the actual implementations of DeltaTable operations.
+  * Richard changes
  */
 trait DeltaTableOperations extends AnalysisHelper { self: DeltaTable =>
 
